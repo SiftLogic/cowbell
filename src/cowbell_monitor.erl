@@ -28,9 +28,9 @@
 
 %% API
 -export([start_link/0]).
--export([connect_node/1]).
--export([disconnect_node/1]).
--export([connect_nodes/0]).
+-export([add/1]).
+-export([remove/1]).
+-export([status/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -39,13 +39,8 @@
 -define(DEFAULT_CHECK_INTERVAL_SEC, 10).
 -define(DEFAULT_ABANDON_NODE_AFTER_SEC, 86400).
 
-%% types
--type disconnected_node_info() :: {Node :: atom(), DisconnectedAt :: non_neg_integer()}.
-
 %% records
 -record(state, {
-          monitored_nodes = [] :: [atom()],
-          disconnected_nodes_info = [] :: list(),
           check_interval_sec = 0 :: non_neg_integer(),
           abandon_node_after_sec :: non_neg_integer(),
           timer_ref = undefined :: undefined | reference()
@@ -59,17 +54,20 @@ start_link() ->
     Options = [],
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], Options).
 
--spec connect_nodes() -> ok.
-connect_nodes() ->
-    gen_server:call(?MODULE, connect_nodes).
+-spec add(Node :: node()) -> ok | {error, connect_failed}.
+add(Node) ->
+    gen_server:call(?MODULE, {add, Node}).
 
--spec connect_node(Node :: node()) -> ok | {error, connect_failed}.
-connect_node(Node) ->
-    gen_server:call(?MODULE, {connect_node, Node}).
+-spec remove(Node :: node()) -> ok.
+remove(Node) ->
+    gen_server:cast(?MODULE, {remove, Node}).
 
--spec disconnect_node(Node :: node()) -> ok.
-disconnect_node(Node) ->
-    gen_server:cast(?MODULE, {disconnect_node, Node}).
+-spec status(Node :: node()) -> {connected, non_neg_integer()} |
+                                {disconnected, non_neg_integer(), non_neg_integer()} |
+                                {abandoned, non_neg_integer()} |
+                                {error, not_monitored}.
+status(Node) ->
+    node_status(Node).
 
 %% ===================================================================
 %% Callbacks
@@ -88,17 +86,13 @@ init([]) ->
     CheckIntervalSec = application:get_env(cowbell, check_interval_sec, ?DEFAULT_CHECK_INTERVAL_SEC),
     AbandonNodeAfterSec = application:get_env(cowbell, abandon_node_after_sec, ?DEFAULT_ABANDON_NODE_AFTER_SEC),
     MonitoredNodes = application:get_env(cowbell, nodes, []),
-
-    %% prepare nodes info
-    DisconnectedNodesInfo = init_disconnected_node_info(MonitoredNodes),
-
+    ok = net_kernel:monitor_nodes(true),
+    ok = init_monitors(MonitoredNodes),
     %% build state
-    {ok, #state{
-            monitored_nodes = MonitoredNodes,
-            disconnected_nodes_info = DisconnectedNodesInfo,
-            check_interval_sec = CheckIntervalSec,
-            abandon_node_after_sec = AbandonNodeAfterSec
-           }}.
+    {ok, timeout(#state{
+                    check_interval_sec = CheckIntervalSec,
+                    abandon_node_after_sec = AbandonNodeAfterSec
+                   })}.
 
 %% ----------------------------------------------------------------------------------------------------------
 %% Call messages
@@ -111,41 +105,46 @@ init([]) ->
                          {stop, Reason :: any(), Reply :: any(), #state{}} |
                          {stop, Reason :: any(), #state{}}.
 
-handle_call(connect_nodes, _From, State) ->
-    %% start listening for events
-    ok = net_kernel:monitor_nodes(true),
-    %% connect
-    State1 = connect_nodes(State),
-    %% return
-    {reply, ok, State1};
-
-handle_call({connect_node, Node}, _From, #state{monitored_nodes = MonitoredNodes,
-                                                disconnected_nodes_info = DisconnectedNodes} = State) ->
-    case lists:member(Node, MonitoredNodes) of
-        true ->
+handle_call({add, Node}, _From, State) ->
+    case node_status(Node) of
+        {ok, connected} ->
             %% Already monitored
             {reply, ok, State};
-        false ->
+        {ok, abandoned} ->
             case net_kernel:connect_node(Node) of
                 true ->
-                    %% successful, do not add to disconnected
-                    {reply,
-                     ok,
-                     State#state{
-                       monitored_nodes = [Node | MonitoredNodes]}};
+                    ok = set_connected(Node),
+                    {reply, ok, State};
                 Error ->
-                    error_logger:warning_msg("Cannot connect to node '~p', will try again: ~p", [Node, Error]),
+                    error_logger:warning_msg("Cannot connect to abandoned node '~p',"
+                                             " will try again: ~p",
+                                             [Node, Error]),
                     %% Could not connect, add to disconnected
-                    [Disconnected] = init_disconnected_node_info([Node]),
-                    {reply,
-                     {error, connect_failed},
-                     State#state{
-                       monitored_nodes = [Node | MonitoredNodes],
-                       disconnected_nodes_info = [Disconnected | DisconnectedNodes]
-                      }}
-            end
+                    ok = set_disconnected(Node),
+                    {reply, {error, connect_failed}, State}
+            end;
+        {ok, disconnected} ->
+            case net_kernel:connect_node(Node) of
+                true ->
+                    ok = set_connected(Node),
+                    {reply, ok, State};
+                Error ->
+                    error_logger:warning_msg("Cannot connect to disconnected node '~p',"
+                                             " will try again: ~p",
+                                             [Node, Error]),
+                    %% Could not connect, add to disconnected
+                    ok = set_disconnected(Node),
+                    {reply, {error, connect_failed}, State}
+            end;
+        {error, not_monitored} ->
+            {reply, case do_connect(Node) of
+                        {error, _} = E ->
+                            set_disconnected(Node),
+                            E;
+                        ok ->
+                            ok
+                    end, State}
     end;
-
 handle_call(Request, From, State) ->
     error_logger:warning_msg("Received from ~p an unknown call message: ~p", [Request, From]),
     {reply, undefined, State}.
@@ -158,23 +157,9 @@ handle_call(Request, From, State) ->
                          {noreply, #state{}, Timeout :: non_neg_integer()} |
                          {stop, Reason :: any(), #state{}}.
 
-handle_cast({disconnect_node, Node}, #state{monitored_nodes = MonitoredNodes,
-                                            disconnected_nodes_info = DisconnectedNodes} = State) ->
-    NewState = case lists:keytake(Node, 1, MonitoredNodes) of
-                   {value, Node, NewMonitored} ->
-                       %% Monitored
-                       true = erlang:disconnect_node(Node),
-                       %% remove from disconnected if it exists
-                       NewDisconnected = lists:keydelete(Node, 1, DisconnectedNodes),
-                       State#state{
-                         monitored_nodes = NewMonitored,
-                         disconnected_nodes_info = NewDisconnected
-                        };
-                   false ->
-                       error_logger:warning_msg("Cannot disconnect unmonitored node '~p'", [Node]),
-                       State
-               end,
-    {noreply, NewState};
+handle_cast({remove, Node}, State) ->
+    ok = remove_node(Node),
+    {noreply, State};
 
 handle_cast(Msg, State) ->
     error_logger:warning_msg("Received an unknown cast message: ~p", [Msg]),
@@ -188,43 +173,27 @@ handle_cast(Msg, State) ->
                          {noreply, #state{}, Timeout :: non_neg_integer()} |
                          {stop, Reason :: any(), #state{}}.
 
-handle_info({nodedown, Node}, #state{
-                                 monitored_nodes = MonitoredNodes,
-                                 disconnected_nodes_info = DisconnectedNodesInfo,
-                                 check_interval_sec = CheckIntervalSec,
-                                 abandon_node_after_sec = AbandonNodeAfterSec
-                                } = State) ->
-    case lists:member(Node, MonitoredNodes) of
-        true ->
-            error_logger:warning_msg(
-              "Node '~p' got disconnected, will try reconnecting every ~p seconds for a max of ~p seconds",
-              [Node, CheckIntervalSec, AbandonNodeAfterSec]
-             ),
-            %% add to disconnected nodes
-            DisconnectedAt = epoch_time(),
-            State1 = State#state{disconnected_nodes_info = [{Node, DisconnectedAt} | DisconnectedNodesInfo]},
-            %% reply
-            {noreply, State1};
-        false ->
-            error_logger:warning_msg("Node '~p' got disconnected but not in list of monitored nodes, ignoring", [Node]),
-            %% reply
-            {noreply, State}
-    end;
+handle_info({nodedown, Node}, #state{check_interval_sec = CheckIntervalSec,
+                                     abandon_node_after_sec = AbandonNodeAfterSec} = State) ->
+    ok = set_disconnected(Node),
+    error_logger:warning_msg(
+      "Node '~p' got disconnected, will try reconnecting every ~p seconds for a max of ~p seconds",
+      [Node, CheckIntervalSec, AbandonNodeAfterSec]
+     ),
+    {noreply, timeout(State)};
 
 handle_info({nodeup, Node}, #state{
-                               disconnected_nodes_info = DisconnectedNodesInfo
                               } = State) ->
+    ok = set_connected(Node),
     error_logger:info_msg("Node '~p' got connected", [Node]),
-    %% remove from list
-    DisconnectedNodesInfo1 = lists:keydelete(Node, 1, DisconnectedNodesInfo),
     %% return
-    {noreply, State#state{disconnected_nodes_info = DisconnectedNodesInfo1}};
+    {noreply, timeout(State)};
 
 handle_info(connect_nodes, State) ->
-    %% connect
-    State1 = connect_nodes(State),
-    %% return
-    {noreply, State1};
+    io:format("Attempting to reconnect nodes~n"),
+    %% reconnect disconnected nodes
+    ok = reconnect(),
+    {noreply, timeout(State)};
 
 handle_info(Info, State) ->
     error_logger:warning_msg("Received an unknown info message: ~p", [Info]),
@@ -249,61 +218,6 @@ code_change(_OldVsn, State, _Extra) ->
 %% ===================================================================
 %% Internal
 %% ===================================================================
--spec init_disconnected_node_info(Nodes :: [atom()]) -> [disconnected_node_info()].
-init_disconnected_node_info(Nodes) ->
-    DisconnectedAt = epoch_time(),
-    F = fun(Node) -> {Node, DisconnectedAt} end,
-    lists:map(F, Nodes).
-
--spec connect_nodes(#state{}) -> #state{}.
-connect_nodes(#state{
-                 disconnected_nodes_info = DisconnectedNodesInfo,
-                 abandon_node_after_sec = AbandonNodeAfterSec
-                } = State) ->
-    %% run
-    DisconnectedNodesInfo1 = connect_nodes(DisconnectedNodesInfo, AbandonNodeAfterSec),
-    %% add timeout
-    State1 = timeout(State),
-    %% return
-    State1#state{disconnected_nodes_info = DisconnectedNodesInfo1}.
-
--spec connect_nodes([disconnected_node_info()], AbandonNodeAfterSec :: non_neg_integer()) ->
-                           [disconnected_node_info()].
-connect_nodes(DisconnectedNodesInfo, AbandonNodeAfterSec) ->
-    connect_nodes(DisconnectedNodesInfo, AbandonNodeAfterSec, []).
-
--spec connect_nodes(
-        [disconnected_node_info()],
-        AbandonNodeAfterSec :: non_neg_integer(),
-        AccNodesInfo :: [disconnected_node_info()]
-       ) -> [disconnected_node_info()].
-connect_nodes([], _, AccNodesInfo) -> AccNodesInfo;
-connect_nodes([{Node, DisconnectedAt} = NodeInfo | TNodesInfo], AbandonNodeAfterSec, AccNodesInfo) ->
-    %% get current time
-    CurrentTime = epoch_time(),
-    %% acc
-    AccNodesInfo1 = case CurrentTime - DisconnectedAt >= AbandonNodeAfterSec of
-                        true ->
-                            %% abandon node
-                            error_logger:info_msg(
-                              "Could not connect to node '~p' after retrying for ~p seconds, abandoning node",
-                              [Node, CurrentTime - DisconnectedAt]
-                             ),
-                            %% abandoned, do not add to acc
-                            AccNodesInfo;
-
-                        _ ->
-                            %% try to connect
-                            case net_kernel:connect_node(Node) of
-                                true ->
-                                    %% successful, do not add to acc
-                                    AccNodesInfo;
-                                _ ->
-                                    %% unsuccessful, add to acc for next round
-                                    [NodeInfo | AccNodesInfo]
-                            end
-                    end,
-    connect_nodes(TNodesInfo, AbandonNodeAfterSec, AccNodesInfo1).
 
 -spec epoch_time() -> non_neg_integer().
 epoch_time() ->
@@ -321,3 +235,92 @@ timeout(#state{
     end,
     TimerRef = erlang:send_after(CheckIntervalSec * 1000, self(), connect_nodes),
     State#state{timer_ref = TimerRef}.
+
+node_status(Node) ->
+    case ets:lookup(cowbell, Node) of
+        [{Node, {R, _, _}}] ->
+            {ok, R};
+        [{Node, {R, _}}] ->
+            {ok, R};
+        [] ->
+            {error, not_monitored}
+    end.
+
+do_connect(Node) ->
+    case net_kernel:connect_node(Node) of
+        true ->
+            set_connected(Node);
+        _Error ->
+            {error, failed_to_connect}
+    end.
+
+set_connected(Node) ->
+    Tstamp = epoch_time(),
+    true = ets:insert(cowbell, {Node, {connected, Tstamp}}),
+    ok.
+
+set_disconnected(Node) ->
+    Tstamp = epoch_time(),
+    true = case ets:lookup(cowbell, Node) of
+               [{Node, {disconnected, FirstTstamp, _LastTstamp}}]
+                 when FirstTstamp + ?DEFAULT_ABANDON_NODE_AFTER_SEC =< Tstamp ->
+                   ets:insert(cowbell, {Node, {abandoned, Tstamp}});
+               [{Node, {disconnected, FirstTstamp, _LastTstamp}}] ->
+                   ets:insert(cowbell, {Node, {disconnected, FirstTstamp, Tstamp}});
+               [{Node, {connected, _LastTstamp}}] ->
+                   ets:insert(cowbell, {Node, {disconnected, Tstamp, Tstamp}});
+               [{Node, {abandoned, _LastTstamp}}] ->
+                   ets:insert(cowbell, {Node, {disconnected, Tstamp, Tstamp}});
+               [] ->
+                   ets:insert(cowbell, {Node, {disconnected, Tstamp, Tstamp}})
+           end,
+    ok.
+
+remove_node(Node) ->
+    _ = erlang:disconnect_node(Node),
+    true = ets:delete(cowbell, Node),
+    ok.
+
+-spec init_monitors(MonitoredNodes :: [node()]) -> ok.
+init_monitors(MonitorNodes0) ->
+    MonitorNodes =
+        ets:foldl(fun({Node, _}, MonNodes) ->
+                          case do_connect(Node) of
+                              ok ->
+                                  ok;
+                              {error, failed_to_connect} ->
+                                  ok = set_disconnected(Node)
+                          end,
+                          lists:delete(Node, MonNodes)
+                  end, MonitorNodes0, cowbell),
+    do_init_monitor(MonitorNodes).
+
+do_init_monitor([]) ->
+    ok;
+do_init_monitor([Node | Rest]) ->
+    case do_connect(Node) of
+        ok ->
+            ok;
+        {error, failed_to_connect} ->
+            ok = set_disconnected(Node)
+    end,
+    do_init_monitor(Rest).
+
+reconnect() ->
+    ets:foldl(
+      fun({Node, {disconnected, _Start, Last}}, _)->
+              Tstamp = epoch_time(),
+              case Last + ?DEFAULT_CHECK_INTERVAL_SEC < Tstamp of
+                  true ->
+                      case do_connect(Node) of
+                          ok ->
+                              ok;
+                          {error, failed_to_connect} ->
+                              ok = set_disconnected(Node)
+                      end;
+                  false ->
+                      ok
+              end;
+         (_Node, _R) ->
+              ok
+      end, ok, cowbell).

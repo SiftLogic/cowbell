@@ -49,6 +49,7 @@ start_link() ->
 -spec init([]) ->
     {ok, {{supervisor:strategy(), non_neg_integer(), pos_integer()}, [supervisor:child_spec()]}}.
 init([]) ->
+    ets:new(cowbell, [public, named_table]),
     Children = [
         ?CHILD(cowbell_monitor, worker)
     ],

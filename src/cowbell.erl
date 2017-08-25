@@ -27,9 +27,9 @@
 
 %% API
 -export([start/0, stop/0]).
--export([connect_nodes/0]).
--export([connect_node/1]).
--export([disconnect_node/1]).
+-export([add/1]).
+-export([remove/1]).
+-export([status/1]).
 
 %% ===================================================================
 %% API
@@ -42,17 +42,20 @@ start() ->
 stop() ->
     ok = application:stop(cowbell).
 
--spec connect_nodes() -> ok.
-connect_nodes() ->
-    cowbell_monitor:connect_nodes().
+-spec add(Node :: node()) -> ok | {error, connect_failed}.
+add(Node) ->
+    cowbell_monitor:add(Node).
 
--spec connect_node(Node :: node()) -> ok | {error, connect_failed}.
-connect_node(Node) ->
-    cowbell_monitor:connect_node(Node).
+-spec remove(Node :: node()) -> ok.
+remove(Node) ->
+    cowbell_monitor:remove(Node).
 
--spec disconnect_node(Node :: node()) -> ok.
-disconnect_node(Node) ->
-    cowbell_monitor:disconnect_node(Node).
+-spec status(Node :: node()) -> {connected, non_neg_integer()} |
+                                {disconnected, non_neg_integer(), non_neg_integer()} |
+                                {abandoned, non_neg_integer()} |
+                                {error, not_monitored}.
+status(Node) ->
+    cowbell_monitor:status(Node).
 
 %% ===================================================================
 %% Internal

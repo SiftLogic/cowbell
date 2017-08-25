@@ -33,19 +33,17 @@
 
 %% tests
 -export([
-    two_nodes_connect/1,
-    two_nodes_reconnect/1,
-    two_nodes_abandon/1
-]).
+         two_nodes_connect/1,
+         two_nodes_reconnect/1,
+         two_nodes_abandon/1
+        ]).
 
 %% records
 -record(state, {
-    monitored_nodes = [] :: [atom()],
-    disconnected_nodes_info = [] :: list(),
-    check_interval_sec = 0 :: non_neg_integer(),
-    abandon_node_after_sec :: non_neg_integer(),
-    timer_ref = undefined :: undefined | reference()
-}).
+          check_interval_sec = 0 :: non_neg_integer(),
+          abandon_node_after_sec :: non_neg_integer(),
+          timer_ref = undefined :: undefined | reference()
+         }).
 
 %% include
 -include_lib("common_test/include/ct.hrl").
@@ -64,7 +62,7 @@
 %% -------------------------------------------------------------------
 all() ->
     [
-        {group, two_nodes}
+     {group, two_nodes}
     ].
 
 %% -------------------------------------------------------------------
@@ -76,20 +74,20 @@ all() ->
 %% TestCase = atom()
 %% Shuffle = shuffle | {shuffle,{integer(),integer(),integer()}}
 %% RepeatType = repeat | repeat_until_all_ok | repeat_until_all_fail |
-%%			   repeat_until_any_ok | repeat_until_any_fail
+%%                         repeat_until_any_ok | repeat_until_any_fail
 %% N = integer() | forever
 %% -------------------------------------------------------------------
 groups() ->
     [
-        {two_nodes, [shuffle], [
-            two_nodes_connect,
-            two_nodes_reconnect,
-            two_nodes_abandon
-        ]}
+     {two_nodes, [shuffle], [
+                             two_nodes_connect,
+                             two_nodes_reconnect,
+                             two_nodes_abandon
+                            ]}
     ].
 %% -------------------------------------------------------------------
 %% Function: init_per_suite(Config0) ->
-%%				Config1 | {skip,Reason} |
+%%                              Config1 | {skip,Reason} |
 %%              {skip_and_save,Reason,Config1}
 %% Config0 = Config1 = [tuple()]
 %% Reason = term()
@@ -106,9 +104,9 @@ init_per_suite(Config) ->
     cowbell:start(),
     %% config
     [
-        {slave_node_short_name, SlaveNodeShortName},
-        {slave_node, SlaveNode}
-        | Config
+     {slave_node_short_name, SlaveNodeShortName},
+     {slave_node, SlaveNode}
+     | Config
     ].
 
 %% -------------------------------------------------------------------
@@ -125,7 +123,7 @@ end_per_suite(Config) ->
 
 %% -------------------------------------------------------------------
 %% Function: init_per_group(GroupName, Config0) ->
-%%				Config1 | {skip,Reason} |
+%%                              Config1 | {skip,Reason} |
 %%              {skip_and_save,Reason,Config1}
 %% GroupName = atom()
 %% Config0 = Config1 = [tuple()]
@@ -135,28 +133,28 @@ init_per_group(_GroupName, Config) -> Config.
 
 %% -------------------------------------------------------------------
 %% Function: end_per_group(GroupName, Config0) ->
-%%				void() | {save_config,Config1}
+%%                              void() | {save_config,Config1}
 %% GroupName = atom()
 %% Config0 = Config1 = [tuple()]
 %% -------------------------------------------------------------------
 end_per_group(_GroupName, _Config) -> ok.
 
-% ----------------------------------------------------------------------------------------------------------
-% Function: init_per_testcase(TestCase, Config0) ->
-%				Config1 | {skip,Reason} | {skip_and_save,Reason,Config1}
-% TestCase = atom()
-% Config0 = Config1 = [tuple()]
-% Reason = term()
-% ----------------------------------------------------------------------------------------------------------
+%% ----------------------------------------------------------------------------------------------------------
+%% Function: init_per_testcase(TestCase, Config0) ->
+%%                               Config1 | {skip,Reason} | {skip_and_save,Reason,Config1}
+%% TestCase = atom()
+%% Config0 = Config1 = [tuple()]
+%% Reason = term()
+%% ----------------------------------------------------------------------------------------------------------
 init_per_testcase(_TestCase, Config) -> Config.
 
-% ----------------------------------------------------------------------------------------------------------
-% Function: end_per_testcase(TestCase, Config0) ->
-%				void() | {save_config,Config1} | {fail,Reason}
-% TestCase = atom()
-% Config0 = Config1 = [tuple()]
-% Reason = term()
-% ----------------------------------------------------------------------------------------------------------
+%% ----------------------------------------------------------------------------------------------------------
+%% Function: end_per_testcase(TestCase, Config0) ->
+%%                               void() | {save_config,Config1} | {fail,Reason}
+%% TestCase = atom()
+%% Config0 = Config1 = [tuple()]
+%% Reason = term()
+%% ----------------------------------------------------------------------------------------------------------
 end_per_testcase(two_nodes_abandon, Config) ->
     %% get slave node name
     SlaveNodeShortName = proplists:get_value(slave_node_short_name, Config),
@@ -223,12 +221,10 @@ two_nodes_abandon(Config) ->
     [] = nodes(),
 
     %% check in disconnected list
-    State0 = sys:get_state(cowbell_monitor),
-    true = lists:keymember(SlaveNode, 1, State0#state.disconnected_nodes_info),
+    [{SlaveNode, {disconnected, _, _}}] = ets:lookup(cowbell, SlaveNode),
 
     %% let abandon period go by
     timer:sleep(5000),
 
     %% check not in disconnected list
-    State1 = sys:get_state(cowbell_monitor),
-    false = lists:keymember(SlaveNode, 1, State1#state.disconnected_nodes_info).
+    [{SlaveNode, {abandoned, _, _}}] = ets:lookup(cowbell, SlaveNode).
