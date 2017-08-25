@@ -28,6 +28,8 @@
 %% API
 -export([start/0, stop/0]).
 -export([connect_nodes/0]).
+-export([connect_node/1]).
+-export([disconnect_node/1]).
 
 %% ===================================================================
 %% API
@@ -43,6 +45,14 @@ stop() ->
 -spec connect_nodes() -> ok.
 connect_nodes() ->
     cowbell_monitor:connect_nodes().
+
+-spec connect_node(Node :: node()) -> ok | {error, connect_failed}.
+connect_node(Node) ->
+    cowbell_monitor:connect_node(Node).
+
+-spec disconnect_node(Node :: node()) -> ok.
+disconnect_node(Node) ->
+    cowbell_monitor:disconnect_node(Node).
 
 %% ===================================================================
 %% Internal
